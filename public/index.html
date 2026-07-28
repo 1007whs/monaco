@@ -1,0 +1,992 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Monaco C++ Editor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+#root { display: flex; height: 100%; }
+#sidebar { width: 220px; min-width: 0; background: #1e1e1e; overflow-y: auto; border-right: 1px solid #333; font: 13px/1.6 'Consolas','Courier New',monospace; user-select: none; }
+#sidebar .dir, #sidebar .file { padding: 1px 8px 1px 0; cursor: pointer; white-space: nowrap; color: #bbb; display:flex; align-items:center; }
+#sidebar .dir:hover, #sidebar .file:hover { background: #2a2d2e; }
+#sidebar .dir.sel, #sidebar .file.sel { background: #37373d; color: #fff; }
+#sidebar .dir .arrow { display:inline-flex; width:16px; justify-content:center; font-size:10px; color:#888; flex-shrink:0; margin-right:4px; }
+#sidebar .file .ficon { width:16px; height:16px; flex-shrink:0; margin-right:4px; vertical-align:middle; }
+#sidebar .children { display: none; padding-left: 16px; }
+#sidebar .dir.open + .children { display: block; }
+#workbench { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#tab-bar { display: flex; background: #252526; height: 35px; align-items: center; overflow-x: auto; flex-shrink: 0; }
+#tab-bar::-webkit-scrollbar { height: 0; }
+#tab-bar .tab { display: flex; align-items: center; padding: 0 10px; height: 100%; cursor: pointer; color: #969696; border-right: 1px solid #2d2d2d; white-space: nowrap; font: 13px sans-serif; position: relative; }
+#tab-bar .tab:hover { background: #2a2d2e; }
+#tab-bar .tab.active { background: #1e1e1e; color: #e0e0e0; }
+#tab-bar .tab .close { margin-left: 6px; width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; border-radius: 2px; font-size: 14px; color: #888; }
+#tab-bar .tab .close:hover { background: rgba(255,255,255,0.15); color: #ccc; }
+#tab-bar .tab .dirty { width: 8px; height: 8px; border-radius: 50%; background: #fff; margin-left: 6px; flex-shrink: 0; }
+#tab-bar .tab.dragging { opacity: 0.3; }
+#tab-bar .tab.drag-over { background: #094771 !important; }
+#workspace-root { padding: 5px 8px; font: 12px/1.4 sans-serif; color: #888; cursor: pointer; border-bottom: 1px solid #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#workspace-root:hover { background: #2a2d2e; color: #ccc; }
+#editor { flex: 1; min-height: 0; }
+#bottom-panel { display:flex; flex-direction:column; flex-shrink:0; max-height:200px; }
+#bottom-panel.collapsed { max-height:0; overflow:hidden; }
+#resize-handle { height:3px; cursor:ns-resize; background:#333; flex-shrink:0; }
+#resize-handle:hover { background:#4ec9b0; }
+#bottom-bar { display:flex; background:#252526; height:28px; align-items:center; flex-shrink:0; }
+#bottom-bar .bottom-tab { padding:0 12px; height:100%; display:flex; align-items:center; cursor:pointer; color:#969696; font:12px sans-serif; border-right:1px solid #2d2d2d; }
+#bottom-bar .bottom-tab.active { background:#1e1e1e; color:#e0e0e0; border-bottom:2px solid #4ec9b0; }
+#bottom-toggle { margin-left:auto; padding:0 10px; cursor:pointer; color:#888; font:12px sans-serif; }
+#bottom-toggle:hover { color:#ccc; }
+.bottom-content { flex:1; background:#1e1e1e; color:#ccc; font:12px/1.5 Consolas,monospace; padding:6px 10px; overflow:auto; }
+.bottom-content .ok { color:#4ec9b0; }
+.bottom-content .err { color:#f14c4c; }
+#save-bar { display:none; position:fixed; bottom:0; right:0; background:#2d2d2d; color:#888; font:12px sans-serif; padding:3px 10px; border-radius:4px 0 0 0; z-index:100; }
+#ctx-menu { position:fixed; display:none; background:#2d2d2d; border:1px solid #555; border-radius:4px; padding:4px 0; z-index:1000; font:13px sans-serif; min-width:130px; }
+#ctx-menu .ctx-item { padding:4px 14px; cursor:pointer; color:#ccc; }
+#ctx-menu .ctx-item:hover { background:#094771; color:#fff; }
+#ctx-menu .ctx-sep { height:1px; background:#555; margin:4px 8px; }
+
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="sidebar"><div id="workspace-root" title="Click to change workspace folder"></div><div id="file-tree"></div></div>
+   <div id="workbench">
+    <div id="tab-bar"></div>
+    <div id="editor"></div>
+      <div id="bottom-panel">
+       <div id="resize-handle"></div>
+       <div id="bottom-bar"><div class="bottom-tab active" data-tab="output">Output</div><div class="bottom-tab" data-tab="clangd">Clangd</div><div id="bottom-toggle" title="Toggle panel">\u25BC</div></div>
+       <div id="bottom-content-output" class="bottom-content"></div>
+       <div id="bottom-content-clangd" class="bottom-content" style="display:none"></div>
+    </div>
+  </div>
+</div>
+<div id="save-bar"></div>
+<script src="/monaco/vs/loader.js"></script>
+<script>
+fetch('/project-root').then(function(r) { return r.json(); }).then(function(config) {
+  require.config({ paths: { vs: '/monaco/vs' } });
+  require(['vs/editor/editor.main'], function() {
+    var root = (new URLSearchParams(location.search)).get('root') || config.root;
+    var rootUri = 'file:///' + root;
+    var uri = monaco.Uri.parse('');
+
+    // ---------- theme (with semantic token colors) ----------
+    var semTokenColors = {
+      namespace:'#4ec9b0',class:'#4ec9b0',struct:'#4ec9b0',enum:'#4ec9b0',type:'#4ec9b0',typeParameter:'#4ec9b0',
+      function:'#d2a8ff',method:'#d2a8ff',member:'#d2a8ff',
+      variable:'#c9d1d9',property:'#c9d1d9',parameter:'#c9d1d9',
+      enumMember:'#79c0ff',constant:'#79c0ff',
+      macro:'#c586c0',keyword:'#c586c0',modifier:'#569cd6',
+      comment:'#8b949e',string:'#a5d6ff',number:'#79c0ff',operator:'#bbbecf',
+    };
+    monaco.editor.defineTheme('vscode2026', { base: 'vs-dark', inherit: true, rules: [], colors: {}, semanticTokenColors: semTokenColors });
+    fetch('/api/theme').then(function(r) { return r.json(); }).then(function(t) {
+      t.semanticTokenColors = semTokenColors;
+      monaco.editor.defineTheme('vscode2026', t);
+      monaco.editor.setTheme('vscode2026');
+    });
+
+    // ---------- LSP over WebSocket ----------
+    var ws, msgId = 0;
+    var pending = {};
+    var semLegend = null;
+
+    function send(method, params) {
+      var id = ++msgId;
+      return new Promise(function(resolve) {
+        pending[id] = resolve;
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: id, method: method, params: params }));
+      });
+    }
+
+    function notify(method, params) {
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: method, params: params }));
+    }
+
+    // ---------- editor (model-based) ----------
+    var el = document.getElementById('editor');
+    var modelCache = {};
+    var initContent = [
+      '#include<bits/stdc++.h>',
+      'using namespace std;',
+      '',
+      'int main() {',
+      '    int n, m;',
+      '    cin >> n >> m;',
+      '    vector<int> a(n);',
+      '    for (int i = 0; i < n; i++) {',
+      '        cin >> a[i];',
+      '    }',
+      '    sort(a.begin(), a.end());',
+      '    for (int x : a) {',
+      '        cout << x << " ";',
+      '    }',
+      '    return 0;',
+      '}',
+    ].join('\n');
+    var getLang = function(path) {
+      var map = { cpp:'cpp',cxx:'cpp',cc:'cpp',c:'cpp',h:'cpp',hpp:'cpp',hxx:'cpp',js:'javascript',ts:'typescript',jsx:'javascript',tsx:'typescript',py:'python',java:'java',cs:'csharp',go:'go',rs:'rust',json:'json',html:'html',css:'css',xml:'xml',yaml:'yaml',yml:'yaml',md:'markdown',txt:'plaintext',sh:'shell',bat:'batch',sql:'sql',php:'php',rb:'ruby',swift:'swift',kt:'kotlin' };
+      return map[path.replace(/\\/g, '/').split('.').pop().toLowerCase()] || 'plaintext';
+    };
+    var fileIconMap = {
+      c:'c',cpp:'cpp',cxx:'cpp',cc:'cpp',h:'h',hpp:'hpp',hxx:'hpp',
+      js:'javascript',jsx:'react',ts:'typescript',tsx:'react_ts',
+      py:'python',java:'java',cs:'csharp',go:'go',rs:'rust',
+      json:'json',html:'html',css:'css',svg:'svg',xml:'xml',
+      yaml:'yaml',yml:'yaml',md:'markdown',
+      php:'php',rb:'ruby',swift:'swift',kt:'kotlin',
+      dart:'dart',scala:'scala',lua:'lua',
+      sh:'console',bash:'console',zsh:'console',ps1:'powershell',
+      bat:'settings',cmd:'settings',
+      vue:'vue',svelte:'svelte',astro:'astro',
+      less:'less',scss:'sass',sass:'sass',styl:'stylus',
+      coffee:'coffee',graphql:'graphql',gql:'graphql',
+      pdf:'pdf',zip:'zip',tar:'zip',gz:'zip',rar:'zip',
+      jpg:'image',jpeg:'image',png:'image',gif:'image',webp:'image',ico:'image',bmp:'image',
+      mp3:'audio',wav:'audio',ogg:'audio',flac:'audio',
+      mp4:'video',avi:'video',mkv:'video',mov:'video',
+      exe:'exe',dll:'dll',jar:'jar',
+      toml:'toml',ini:'settings',cfg:'settings',conf:'settings',
+      tex:'tex',bib:'bibliography',
+      makefile:'makefile',gradle:'gradle',cmake:'cmake',
+      lock:'lock',yarn:'yarn',pnpm:'pnpm',
+      prisma:'prisma',zig:'zig',nim:'nim',elixir:'elixir',erlang:'erlang',
+      haskell:'haskell',clj:'clojure',cljs:'clojure',cljc:'clojure',
+      r:'r',julia:'julia',
+      ppt:'powerpoint',pptx:'powerpoint',doc:'word',docx:'word',xls:'table',xlsx:'table',
+    };
+    function getFileIcon(path) {
+      var ext = path.replace(/\\/g, '/').split('.').pop().toLowerCase();
+      return fileIconMap[ext] || 'file';
+    }
+    function switchModel(filePath) {
+      if (modelCache[filePath]) {
+        editor.setModel(modelCache[filePath]);
+        return;
+      }
+      var f = openFiles[filePath];
+      if (!f) return;
+      var uri = monaco.Uri.parse('file:///' + filePath.replace(/\\/g, '/'));
+      var m = monaco.editor.createModel(f.content, getLang(filePath), uri);
+      modelCache[filePath] = m;
+      editor.setModel(m);
+    }
+    var initialUri = monaco.Uri.parse('file:///' + root.replace(/\\/g, '/') + '/main.cpp');
+    var initialModel = monaco.editor.createModel(initContent, 'cpp', initialUri);
+    modelCache[''] = initialModel;
+    var editor = monaco.editor.create(el, {
+      model: initialModel,
+      theme: 'vscode2026',
+      automaticLayout: true,
+      fontSize: 14,
+      tabSize: 4,
+      insertSpaces: true,
+      detectIndentation: false,
+    });
+
+    // ---------- init LSP ----------
+    function initLsp() {
+      return send('initialize', {
+        processId: null, rootUri: rootUri,
+        capabilities: {
+          textDocument: {
+            completion: { completionItem: { snippetSupport: false } },
+            hover: { contentFormat: ['markdown', 'plaintext'] },
+            definition: { linkSupport: true },
+            semanticTokens: {
+              requests: { full: { delta: true } },
+              formats: ['relative'],
+            },
+            synchronization: { didSave: false },
+          },
+        },
+      }).then(function(result) {
+        semLegend = result.capabilities.semanticTokensProvider;
+        if (semLegend) {
+          monaco.languages.registerDocumentSemanticTokensProvider('cpp', {
+            getLegend: function() { return semLegend; },
+            provideDocumentSemanticTokens: function(model) {
+              return send('textDocument/semanticTokens/full', {
+                textDocument: { uri: model.uri.toString() },
+              }).then(function(r) {
+                if (r && r.data) return { data: new Uint32Array(r.data) };
+                return null;
+              });
+            },
+          });
+        }
+        notify('initialized', {});
+        if (activeFile && isCpp(activeFile)) {
+          var model = editor.getModel();
+          notify('textDocument/didOpen', {
+            textDocument: { uri: model ? model.uri.toString() : uri.toString(), languageId: 'cpp', version: fileVersion[activeFile] || 1, text: editor.getValue() },
+          });
+        }
+      });
+    }
+
+
+
+    // ---------- connect ----------
+    (function connect() {
+      ws = new WebSocket(location.origin.replace(/^http/, 'ws'));
+      ws.onopen = function() { initLsp(); };
+      ws.onmessage = function(e) {
+        var msg;
+        try { msg = JSON.parse(e.data); } catch(_) { return; }
+        if (msg.id != null && pending[msg.id]) {
+          pending[msg.id](msg.result);
+          delete pending[msg.id];
+        }
+        if (msg.method === 'textDocument/publishDiagnostics') {
+          monaco.editor.setModelMarkers(editor.getModel(), 'clangd',
+            (msg.params.diagnostics || []).map(function(d) {
+              var sev = d.severity <= 2 ? monaco.MarkerSeverity.Error
+                      : d.severity === 3 ? monaco.MarkerSeverity.Warning
+                      : monaco.MarkerSeverity.Info;
+              return {
+                severity: sev,
+                message: d.message,
+                startLineNumber: d.range.start.line + 1,
+                startColumn: d.range.start.character + 1,
+                endLineNumber: d.range.end.line + 1,
+                endColumn: d.range.end.character + 1,
+              };
+            })
+          );
+        }
+        if (msg.method === 'clangd/log') {
+          clangdBuf.push(msg.params.text);
+          document.getElementById('bottom-panel').classList.remove('collapsed');
+          if (activeTab === 'clangd') {
+            var c = document.getElementById('bottom-content-clangd');
+            c.innerHTML += '<div>' + ansiToHtml(msg.params.text) + '</div>';
+            c.scrollTop = c.scrollHeight;
+          }
+        }
+      };
+      ws.onclose = function() { setTimeout(connect, 1000); };
+    })();
+
+    // ---------- providers ----------
+    monaco.languages.registerCompletionItemProvider('cpp', {
+      triggerCharacters: ['.', ':', '>', '<', '/', '"'],
+      provideCompletionItems: function(model, position) {
+        return send('textDocument/completion', {
+          textDocument: { uri: model.uri.toString() },
+          position: { line: position.lineNumber - 1, character: position.column - 1 },
+          context: { triggerKind: 1 },
+        }).then(function(result) {
+          if (!result) return { suggestions: [] };
+          var items = result.items || (result.isIncomplete !== undefined ? result : []);
+          var list = Array.isArray(items) ? items : [];
+          return { suggestions: list.map(function(c) {
+            var km = {1:0,2:0,3:1,4:1,5:9,6:3,7:9,8:2,9:3,10:10,11:4,12:5,13:6,14:8,15:9,16:9,17:9,18:9,19:10,20:9,21:9,22:9,23:9,24:9,25:9};
+            return {
+              label: c.label,
+              kind: km[c.kind] || 0,
+              detail: c.detail || '',
+              insertText: (c.textEdit && c.textEdit.newText) || c.insertText || c.label,
+              range: c.textEdit && c.textEdit.range ? {
+                startLineNumber: c.textEdit.range.start.line + 1,
+                startColumn: c.textEdit.range.start.character + 1,
+                endLineNumber: c.textEdit.range.end.line + 1,
+                endColumn: c.textEdit.range.end.character + 1,
+              } : undefined,
+            };
+          })};
+        });
+      },
+    });
+
+    monaco.languages.registerHoverProvider('cpp', {
+      provideHover: function(model, position) {
+        return send('textDocument/hover', {
+          textDocument: { uri: model.uri.toString() },
+          position: { line: position.lineNumber - 1, character: position.column - 1 },
+        }).then(function(result) {
+          if (!result || !result.contents) return null;
+          var contents = Array.isArray(result.contents) ? result.contents : [result.contents];
+          return {
+            range: result.range ? {
+              startLineNumber: result.range.start.line + 1,
+              startColumn: result.range.start.character + 1,
+              endLineNumber: result.range.end.line + 1,
+              endColumn: result.range.end.character + 1,
+            } : undefined,
+            contents: contents.map(function(c) { return { value: typeof c === 'string' ? c : c.value }; }),
+          };
+        });
+      },
+    });
+
+    monaco.languages.registerDefinitionProvider('cpp', {
+      provideDefinition: function(model, position) {
+        return send('textDocument/definition', {
+          textDocument: { uri: model.uri.toString() },
+          position: { line: position.lineNumber - 1, character: position.column - 1 },
+        }).then(function(result) {
+          if (!result) return null;
+          var locs = Array.isArray(result) ? result : [result];
+          return locs.map(function(l) {
+            return {
+              uri: monaco.Uri.parse(l.uri),
+              range: {
+                startLineNumber: l.range.start.line + 1,
+                startColumn: l.range.start.character + 1,
+                endLineNumber: l.range.end.line + 1,
+                endColumn: l.range.end.character + 1,
+              },
+            };
+          });
+        });
+      },
+    });
+
+    // ---------- tabs / open files ----------
+    var activeFile = null;
+    var openFiles = {};   // { path: { content, savedContent } }
+    var tabOrder = [];    // ordered array of paths
+    var fileVersion = {}; // { path: version }
+
+    var wsSaveTimer;
+
+    function isCpp(path) { return /\.(cpp|cxx|cc|c|h|hpp|hxx)$/i.test(path); }
+
+    function setLanguage(path) {
+      var ext = path.replace(/\\/g, '/').split('.').pop().toLowerCase();
+      var map = { cpp:'cpp',cxx:'cpp',cc:'cpp',c:'cpp',h:'cpp',hpp:'cpp',hxx:'cpp',js:'javascript',ts:'typescript',jsx:'javascript',tsx:'typescript',py:'python',java:'java',cs:'csharp',go:'go',rs:'rust',json:'json',html:'html',css:'css',xml:'xml',yaml:'yaml',yml:'yaml',md:'markdown',txt:'plaintext',sh:'shell',bat:'batch',sql:'sql',php:'php',rb:'ruby',swift:'swift',kt:'kotlin' };
+      var lang = map[ext] || 'plaintext';
+      monaco.editor.setModelLanguage(editor.getModel(), lang);
+    }
+
+    function saveWorkspaceState() {
+      clearTimeout(wsSaveTimer);
+      wsSaveTimer = setTimeout(function() {
+        var rel = function(p) { return p.replace(root, '').replace(/\\/g, '/').replace(/^\//, ''); };
+        var internal = tabOrder.filter(function(p) { return p.indexOf(root) === 0; });
+        var state = { openFiles: internal.map(rel), activeFile: activeFile && activeFile.indexOf(root) === 0 ? rel(activeFile) : null, fontSize: editor.getOption(monaco.editor.EditorOption.fontSize) };
+        fetch('/api/file', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: root + '/.monaco-editor', content: JSON.stringify(state) }),
+        });
+      }, 300);
+    }
+
+    function renderTabs() {
+      var bar = document.getElementById('tab-bar');
+      bar.innerHTML = '';
+      tabOrder.forEach(function(p) {
+        var tab = document.createElement('div');
+        tab.className = 'tab' + (p === activeFile ? ' active' : '');
+        tab.draggable = true;
+        var name = p.replace(/\\/g, '/').split('/').pop();
+        tab.innerHTML = name + (openFiles[p].content !== openFiles[p].savedContent ? '<span class="dirty"></span>' : '');
+        tab.addEventListener('dragstart', function(e) { e.dataTransfer.setData('text/plain', p); tab.classList.add('dragging'); });
+        tab.addEventListener('dragend', function() { bar.querySelectorAll('.dragging,.drag-over').forEach(function(e) { e.classList.remove('dragging','drag-over'); }); });
+        tab.addEventListener('dragover', function(e) { e.preventDefault(); tab.classList.add('drag-over'); });
+        tab.addEventListener('dragleave', function() { tab.classList.remove('drag-over'); });
+        tab.addEventListener('drop', function(e) {
+          e.preventDefault(); e.stopPropagation();
+          var from = e.dataTransfer.getData('text/plain');
+          var to = p;
+          if (from && from !== to) {
+            var fi = tabOrder.indexOf(from), ti = tabOrder.indexOf(to);
+            if (fi !== -1 && ti !== -1) {
+              tabOrder.splice(fi, 1);
+              ti = tabOrder.indexOf(to);
+              tabOrder.splice(ti, 0, from);
+              renderTabs();
+              saveWorkspaceState();
+            }
+          }
+          tab.classList.remove('drag-over');
+          bar.querySelectorAll('.dragging,.drag-over').forEach(function(e) { e.classList.remove('dragging','drag-over'); });
+        });
+        var close = document.createElement('span');
+        close.className = 'close';
+        close.textContent = '\u00D7';
+        close.addEventListener('click', function(e) { e.stopPropagation(); closeFile(p); });
+        tab.appendChild(close);
+        tab.addEventListener('click', function() { if (activeFile !== p) switchFile(p); });
+        bar.appendChild(tab);
+      });
+    }
+
+    function switchFile(filePath) {
+      if (activeFile === filePath) return;
+      var prevCpp = activeFile && isCpp(activeFile);
+      var nextCpp = isCpp(filePath);
+      if (activeFile) openFiles[activeFile].content = editor.getValue();
+      var oldUri = uri;
+      activeFile = filePath;
+      var f = openFiles[filePath];
+      switchModel(filePath);
+      uri = editor.getModel().uri;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (prevCpp) notify('textDocument/didClose', { textDocument: { uri: oldUri.toString() } });
+        if (nextCpp) {
+          fileVersion[filePath] = (fileVersion[filePath] || 0) + 1;
+          notify('textDocument/didOpen', {
+            textDocument: { uri: uri.toString(), languageId: 'cpp', version: fileVersion[filePath], text: f.content },
+          });
+        }
+      }
+      renderTabs();
+      updateSidebarSel();
+      saveWorkspaceState();
+    }
+
+    function closeFile(filePath) {
+      var idx = tabOrder.indexOf(filePath);
+      if (idx === -1) return;
+      tabOrder.splice(idx, 1);
+      if (modelCache[filePath]) { modelCache[filePath].dispose(); delete modelCache[filePath]; }
+      delete openFiles[filePath];
+      delete fileVersion[filePath];
+      if (activeFile === filePath) {
+        if (ws && ws.readyState === WebSocket.OPEN && isCpp(filePath)) {
+          notify('textDocument/didClose', { textDocument: { uri: uri.toString() } });
+        }
+        var next = tabOrder.length ? tabOrder[Math.min(idx, tabOrder.length - 1)] : null;
+        if (next) {
+          activeFile = next;
+          switchModel(next);
+          uri = editor.getModel().uri;
+          fileVersion[next] = (fileVersion[next] || 0) + 1;
+          if (ws && ws.readyState === WebSocket.OPEN && isCpp(next)) {
+            notify('textDocument/didOpen', {
+              textDocument: { uri: uri.toString(), languageId: 'cpp', version: fileVersion[next], text: openFiles[next].content },
+            });
+          }
+        } else {
+          activeFile = null;
+          switchModel('');
+          uri = editor.getModel().uri;
+        }
+      }
+      renderTabs();
+      updateSidebarSel();
+      saveWorkspaceState();
+    }
+
+    function updateSidebarSel() {
+      document.querySelectorAll('#sidebar .sel').forEach(function(e) { e.classList.remove('sel'); });
+      if (!activeFile) return;
+      var fname = activeFile.replace(/\\/g, '/').split('/').pop();
+      var items = document.querySelectorAll('#sidebar .file');
+      for (var k = 0; k < items.length; k++) {
+        if (items[k].textContent === fname) { items[k].classList.add('sel'); break; }
+      }
+    }
+
+    // ---------- file tree ----------
+    function loadDir(dirPath, parentEl) {
+      fetch('/api/files?path=' + encodeURIComponent(dirPath)).then(function(r) { return r.json(); }).then(function(data) {
+        parentEl.innerHTML = '';
+        data.dirs.forEach(function(d) {
+          var div = document.createElement('div');
+          div.className = 'dir';
+          var arrow = document.createElement('span');
+          arrow.className = 'arrow';
+          arrow.textContent = '\u25B6';
+          div.appendChild(arrow);
+          div.appendChild(document.createTextNode(' ' + d));
+          attachTreeEvents(div, true, dirPath + '/' + d);
+          var children = document.createElement('div');
+          children.className = 'children';
+          div.addEventListener('click', function(e) {
+            e.stopPropagation();
+            div.classList.toggle('open');
+            arrow.textContent = div.classList.contains('open') ? '\u25BC' : '\u25B6';
+            if (!children.hasChildNodes()) {
+              children.innerHTML = '<div style="color:#666;padding-left:16px">loading...</div>';
+              loadDir(dirPath + '/' + d, children);
+            }
+          });
+          parentEl.appendChild(div);
+          parentEl.appendChild(children);
+        });
+        data.files.forEach(function(f) {
+          var div = document.createElement('div');
+          div.className = 'file';
+          var img = document.createElement('img');
+          img.className = 'ficon';
+          img.src = '/icons/' + getFileIcon(f) + '.svg';
+          img.draggable = false;
+          div.appendChild(img);
+          div.appendChild(document.createTextNode(f));
+          attachTreeEvents(div, false, dirPath + '/' + f);
+          div.addEventListener('click', function() { openFile(dirPath + '/' + f); });
+          parentEl.appendChild(div);
+        });
+      });
+    }
+
+    function openFile(filePath) {
+      if (openFiles[filePath]) {
+        switchFile(filePath);
+        return;
+      }
+      fetch('/api/file?path=' + encodeURIComponent(filePath)).then(function(r) { return r.json(); }).then(function(data) {
+        if (data.content === undefined) return;
+        openFiles[filePath] = { content: data.content, savedContent: data.content };
+        fileVersion[filePath] = 1;
+        tabOrder.push(filePath);
+        if (activeFile === null) {
+          activeFile = filePath;
+          switchModel(filePath);
+          uri = editor.getModel().uri;
+          if (ws && ws.readyState === WebSocket.OPEN && isCpp(filePath)) {
+            notify('textDocument/didOpen', {
+              textDocument: { uri: uri.toString(), languageId: 'cpp', version: fileVersion[filePath], text: data.content },
+            });
+          }
+        } else {
+          var oldUri = uri;
+          var prevCpp = isCpp(activeFile);
+          var nextCpp = isCpp(filePath);
+          openFiles[activeFile].content = editor.getValue();
+          activeFile = filePath;
+          switchModel(filePath);
+          uri = editor.getModel().uri;
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            if (prevCpp) notify('textDocument/didClose', { textDocument: { uri: oldUri.toString() } });
+            if (nextCpp) {
+              notify('textDocument/didOpen', {
+                textDocument: { uri: uri.toString(), languageId: 'cpp', version: fileVersion[filePath], text: data.content },
+              });
+            }
+          }
+        }
+        renderTabs();
+        updateSidebarSel();
+        saveWorkspaceState();
+      });
+    }
+
+    // ---------- save ----------
+    function saveFile() {
+      if (!activeFile) return;
+      var f = openFiles[activeFile];
+      f.content = editor.getValue();
+      f.savedContent = f.content;
+      fetch('/api/file', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: activeFile, content: f.content }),
+      }).then(function(r) { return r.json(); }).then(function() {
+        renderTabs();
+        var bar = document.getElementById('save-bar');
+        bar.textContent = 'saved ' + activeFile.replace(/\\/g, '/').split('/').pop();
+        bar.style.display = 'block';
+        clearTimeout(bar._t);
+        bar._t = setTimeout(function() { bar.style.display = 'none'; }, 2000);
+      });
+    }
+
+    // ---------- LSP: didChange ----------
+    editor.onDidChangeModelContent(function() {
+      if (!activeFile) return;
+      var model = editor.getModel();
+      if (!model) return;
+      openFiles[activeFile].content = editor.getValue();
+      fileVersion[activeFile] = (fileVersion[activeFile] || 0) + 1;
+      if (isCpp(activeFile)) {
+        notify('textDocument/didChange', {
+          textDocument: { uri: model.uri.toString(), version: fileVersion[activeFile] },
+          contentChanges: [{ text: openFiles[activeFile].content }],
+        });
+      }
+      renderTabs();
+    });
+
+    // ---------- zoom (ctrl+wheel) ----------
+    window.addEventListener('wheel', function(e) {
+      if ((e.ctrlKey || e.metaKey) && document.getElementById('editor').contains(e.target)) {
+        e.preventDefault();
+        var size = editor.getOption(monaco.editor.EditorOption.fontSize);
+        size = Math.max(10, Math.min(40, size + (e.deltaY > 0 ? -1 : 1)));
+        editor.updateOptions({ fontSize: size });
+        saveWorkspaceState();
+      }
+    }, { capture: true, passive: false });
+
+    // ---------- bottom panel ----------
+    var clangdBuf = [];
+    var activeTab = 'output';
+    document.getElementById('bottom-bar').addEventListener('click', function(e) {
+      var tab = e.target.closest && e.target.closest('.bottom-tab');
+      if (!tab) return;
+      if (tab.dataset.tab === activeTab) return;
+      activeTab = tab.dataset.tab;
+      document.querySelectorAll('#bottom-bar .bottom-tab').forEach(function(t) { t.classList.toggle('active', t.dataset.tab === activeTab); });
+      document.getElementById('bottom-content-output').style.display = activeTab === 'output' ? '' : 'none';
+      document.getElementById('bottom-content-clangd').style.display = activeTab === 'clangd' ? '' : 'none';
+      if (activeTab === 'clangd') {
+        var c = document.getElementById('bottom-content-clangd');
+        c.innerHTML = '';
+        clangdBuf.forEach(function(t) { c.innerHTML += '<div>' + ansiToHtml(t) + '</div>'; });
+        c.scrollTop = c.scrollHeight;
+      }
+    });
+    function ansiToHtml(s) {
+      var styles = { '0':'', '1':'font-weight:bold', '30':'color:#888', '31':'color:#f14c4c', '32':'color:#4ec9b0', '33':'color:#dcdcaa', '34':'color:#569cd6', '35':'color:#c586c0', '36':'color:#4ec9b0', '37':'color:#ccc', '90':'color:#888', '91':'color:#f14c4c', '92':'color:#4ec9b0', '93':'color:#dcdcaa', '94':'color:#569cd6', '95':'color:#c586c0', '96':'color:#4ec9b0', '97':'color:#e0e0e0' };
+      return s.replace(/\x1b\[(\d+)m/g, function(_, c) { return c === '0' ? '</span>' : '<span style="' + (styles[c]||'') + '">'; });
+    }
+    document.getElementById('bottom-toggle').addEventListener('click', function() {
+      var p = document.getElementById('bottom-panel');
+      p.classList.toggle('collapsed');
+      this.textContent = p.classList.contains('collapsed') ? '\u25B2' : '\u25BC';
+    });
+
+    // ---------- resize handle ----------
+    (function() {
+      var handle = document.getElementById('resize-handle');
+      var panel = document.getElementById('bottom-panel');
+      var startY, startH;
+      function onMove(e) {
+        var h = startH - (e.clientY - startY);
+        h = Math.max(50, Math.min(400, h));
+        panel.style.maxHeight = h + 'px';
+        panel.style.minHeight = h + 'px';
+      }
+      function onUp() { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); }
+      handle.addEventListener('mousedown', function(e) {
+        startY = e.clientY; startH = panel.offsetHeight;
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
+        e.preventDefault();
+      });
+    })();
+
+    // ---------- compile / run ----------
+    var lastCompiled = {}; // { path: content }
+
+    function showOutput(text, type) {
+      var panel = document.getElementById('bottom-panel');
+      panel.classList.remove('collapsed');
+      var content = document.getElementById('bottom-content-output');
+      var el = document.createElement('div');
+      el.className = type;
+      el.textContent = text;
+      content.appendChild(el);
+      content.scrollTop = content.scrollHeight;
+    }
+
+    function compileFile() {
+      if (!activeFile) { showOutput('no file open', 'err'); return Promise.resolve(false); }
+      showOutput('compiling ' + activeFile.replace(/\\/g, '/').split('/').pop() + '...', 'ok');
+      return fetch('/api/compile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: activeFile, content: editor.getValue() }),
+      }).then(function(r) { return r.json(); }).then(function(result) {
+        if (result.ok) {
+          lastCompiled[activeFile] = editor.getValue();
+          showOutput('compile OK', 'ok');
+          return true;
+        }
+        showOutput(result.error || 'compile failed', 'err');
+        return false;
+      });
+    }
+
+    function runFile() {
+      if (!activeFile) return;
+      fetch('/api/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: activeFile }),
+      });
+    }
+
+    function compileAndRun() {
+      if (activeFile && lastCompiled[activeFile] === editor.getValue()) {
+        showOutput('run (no recompile needed)', 'ok');
+        runFile();
+      } else {
+        compileFile().then(function(ok) { if (ok) runFile(); });
+      }
+    }
+
+    var _chord = null;
+    document.addEventListener('keydown', function(e) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+        e.preventDefault();
+        saveFile();
+        return;
+      }
+      if (e.key === 'F9') {
+        e.preventDefault();
+        compileFile();
+        return;
+      }
+      if (e.key === 'F10') {
+        e.preventDefault();
+        compileAndRun();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        _chord = 'k';
+        setTimeout(function() { _chord = null; }, 1000);
+        e.preventDefault();
+        return;
+      }
+      if (_chord === 'k' && (e.ctrlKey || e.metaKey) && (e.key === 'o' || e.key === 'O')) {
+        e.preventDefault();
+        _chord = null;
+        openWorkspaceDialog();
+        return;
+      }
+      _chord = null;
+    });
+
+    document.getElementById('workspace-root').textContent = root;
+    document.getElementById('workspace-root').addEventListener('click', openWorkspaceDialog);
+
+    // ---------- workspace dialog (Ctrl+K Ctrl+O / native folder picker) ----------
+    function openWorkspaceDialog() {
+      var input = document.createElement('input');
+      input.type = 'file';
+      input.setAttribute('webkitdirectory', '');
+      input.setAttribute('directory', '');
+      input.style.display = 'none';
+      document.body.appendChild(input);
+      input.addEventListener('change', function() {
+        if (input.files.length > 0) {
+          var f = input.files[0];
+          if (f.path) {
+            var dir = f.webkitRelativePath ? f.path.slice(0, -f.webkitRelativePath.length).replace(/[\\/]$/, '') : f.path.split(/[\\/]/).slice(0, -1).join('/');
+            if (dir && dir !== root) {
+              window.location.href = '?root=' + encodeURIComponent(dir.replace(/\\/g, '/'));
+              document.body.removeChild(input);
+              return;
+            }
+          }
+        }
+        document.body.removeChild(input);
+        var p = window.prompt('Enter workspace folder path:', root);
+        if (p && p.trim() && p.trim() !== root) {
+          window.location.href = '?root=' + encodeURIComponent(p.trim().replace(/\\/g, '/'));
+        }
+      });
+      input.click();
+    }
+
+    // ---------- sidebar drag-and-drop (folder → open workspace) ----------
+    var sidebar = document.getElementById('sidebar');
+    sidebar.addEventListener('dragover', function(e) { e.preventDefault(); e.stopPropagation(); });
+    sidebar.addEventListener('drop', function(e) {
+      e.preventDefault(); e.stopPropagation();
+      var files = e.dataTransfer.files;
+      if (files && files.length) {
+        for (var i = 0; i < files.length; i++) {
+          var f = files[i];
+          if (f.path && f.webkitRelativePath) {
+            var dir = f.path.slice(0, -f.webkitRelativePath.length).replace(/[\\/]$/, '');
+            if (dir && dir !== root) { window.location.href = '?root=' + encodeURIComponent(dir.replace(/\\/g, '/')); return; }
+          }
+        }
+        var p = files[0].path;
+        if (p) {
+          var dir = p.split(/[\\/]/).slice(0, -1).join('/');
+          if (dir !== root) { window.location.href = '?root=' + encodeURIComponent(dir.replace(/\\/g, '/')); return; }
+        }
+      }
+    });
+
+    // ---------- page drag-and-drop (file → open, with clangd for cpp) ----------
+    document.addEventListener('dragover', function(e) { e.preventDefault(); });
+    document.addEventListener('drop', function(e) {
+      e.preventDefault();
+      var files = e.dataTransfer.files;
+      if (!files || !files.length) return;
+      for (var i = 0; i < files.length; i++) {
+        (function(file) {
+          if (file.path) { openFile(file.path); return; }
+          var reader = new FileReader();
+          reader.onload = function(ev) {
+            var dst = root + '/' + file.name;
+            fetch('/api/file', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ path: dst, content: ev.target.result }),
+            }).then(function() {
+              openFile(dst);
+            });
+          };
+          reader.readAsText(file);
+        })(files[i]);
+      }
+    });
+
+    // ---------- context menu (right-click) ----------
+    var ctxMenu = document.createElement('div');
+    ctxMenu.id = 'ctx-menu';
+    document.body.appendChild(ctxMenu);
+    var ctxTarget = null, ctxIsDir = false;
+    function showCtx(e, isDir) {
+      e.preventDefault(); e.stopPropagation();
+      ctxTarget = e.currentTarget;
+      ctxIsDir = isDir;
+      var fp = ctxTarget._fullPath;
+      var isRoot = !fp || fp === root;
+      ctxMenu.innerHTML = '';
+      if (isDir) {
+        addCtxItem('New File', function() {
+          var name = prompt('File name:'); if (!name) return;
+          fetch('/api/file/create', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: (isRoot ? root : fp) + '/' + name }),
+          }).then(refreshTree);
+        });
+        addCtxItem('New Folder', function() {
+          var name = prompt('Folder name:'); if (!name) return;
+          fetch('/api/dir/create', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: (isRoot ? root : fp) + '/' + name }),
+          }).then(refreshTree);
+        });
+        addCtxSep();
+      }
+      if (!isRoot) {
+        addCtxItem('Rename', function() {
+          var name = prompt('New name:', ctxTarget.textContent.trim());
+          if (!name || name === ctxTarget.textContent.trim()) return;
+          var oldPath = fp;
+          var newPath = oldPath.replace(/[^\\/]+$/, name);
+          fetch('/api/rename', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ oldPath: oldPath, newPath: newPath }),
+          }).then(function() {
+            refreshTree();
+            if (openFiles[oldPath]) {
+              openFiles[newPath] = openFiles[oldPath];
+              delete openFiles[oldPath];
+              var idx = tabOrder.indexOf(oldPath);
+              if (idx !== -1) tabOrder[idx] = newPath;
+              if (fileVersion[oldPath] !== undefined) { fileVersion[newPath] = fileVersion[oldPath]; delete fileVersion[oldPath]; }
+              if (activeFile === oldPath) activeFile = newPath;
+              renderTabs(); saveWorkspaceState();
+            }
+          });
+        });
+        addCtxItem('Delete', function() {
+          fetch('/api/' + (ctxIsDir ? 'dir' : 'file') + '?path=' + encodeURIComponent(fp), { method: 'DELETE' }).then(function() {
+            if (openFiles[fp]) closeFile(fp);
+            refreshTree();
+          });
+        });
+      }
+      if (fp && /\.cpp$/i.test(fp)) {
+        addCtxItem('Run (.exe)', function() {
+          var content = openFiles[fp] ? openFiles[fp].content : undefined;
+          showOutput('running ' + fp.split('/').pop().split('\\').pop() + '...', 'ok');
+          fetch('/api/compile', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: fp, content: content }),
+          }).then(function(r) { return r.json(); }).then(function(result) {
+            if (result.ok) { fetch('/api/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: fp }) }); }
+            else { showOutput(result.error || 'compile failed', 'err'); }
+          });
+        });
+      }
+      addCtxItem('Show in File Explorer', function() {
+        fetch('/api/reveal', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: isRoot ? root : fp }),
+        });
+      });
+      ctxMenu.style.left = e.clientX + 'px';
+      ctxMenu.style.top = e.clientY + 'px';
+      ctxMenu.style.display = 'block';
+    }
+    function addCtxItem(label, fn) {
+      var el = document.createElement('div');
+      el.className = 'ctx-item'; el.textContent = label;
+      el.addEventListener('click', function() { ctxMenu.style.display = 'none'; fn(); });
+      ctxMenu.appendChild(el);
+    }
+    function addCtxSep() {
+      var el = document.createElement('div');
+      el.className = 'ctx-sep'; ctxMenu.appendChild(el);
+    }
+    document.addEventListener('click', function() { ctxMenu.style.display = 'none'; });
+
+    // ---------- file tree helpers ----------
+    function attachTreeEvents(div, isDir, fullPath) {
+      div._fullPath = fullPath;
+      div.addEventListener('contextmenu', function(e) { showCtx(e, isDir); });
+    }
+    attachTreeEvents(document.getElementById('file-tree'), true, root);
+    attachTreeEvents(document.getElementById('sidebar'), true, root);
+
+    // ---------- file tree hot-reload ----------
+    var dirCache = {};
+    setInterval(function() {
+      fetch('/api/files?path=' + encodeURIComponent(root)).then(function(r) { return r.json(); }).then(function(data) {
+        var key = JSON.stringify(data.dirs) + JSON.stringify(data.files);
+        if (dirCache.root === key) return;
+        dirCache.root = key;
+        refreshTree();
+      });
+    }, 3000);
+
+    function refreshTree() {
+      loadDir(root, document.getElementById('file-tree'));
+    }
+
+    function loadWorkspaceState() {
+      fetch('/api/file?path=' + encodeURIComponent(root + '/.monaco-editor')).then(function(r) { return r.json(); }).then(function(d) {
+        if (!d || !d.content) return;
+        try {
+          var state = JSON.parse(d.content);
+          if (!state.openFiles || !state.openFiles.length) return;
+          var abs = function(p) { return root + '/' + p.replace(/\\/g, '/'); };
+          var paths = state.openFiles.map(abs);
+          var activeAbs = state.activeFile ? abs(state.activeFile) : null;
+          var seq = Promise.resolve();
+          paths.forEach(function(p) {
+            seq = seq.then(function() {
+              return fetch('/api/file?path=' + encodeURIComponent(p)).then(function(r) { return r.json(); }).then(function(d2) {
+                if (d2 && d2.content !== undefined) {
+                  openFiles[p] = { content: d2.content, savedContent: d2.content };
+                  fileVersion[p] = 1;
+                  tabOrder.push(p);
+                }
+              });
+            });
+          });
+          seq.then(function() {
+            if (activeAbs && openFiles[activeAbs]) {
+              activeFile = activeAbs;
+              switchModel(activeAbs);
+              uri = editor.getModel().uri;
+              if (ws && ws.readyState === WebSocket.OPEN && isCpp(activeAbs)) {
+                notify('textDocument/didOpen', {
+                  textDocument: { uri: uri.toString(), languageId: 'cpp', version: fileVersion[activeAbs], text: openFiles[activeAbs].content },
+                });
+              }
+            } else if (paths.length && openFiles[paths[0]]) {
+              activeFile = paths[0];
+              switchModel(paths[0]);
+              uri = editor.getModel().uri;
+            }
+            if (state.fontSize) editor.updateOptions({ fontSize: state.fontSize });
+            renderTabs();
+            updateSidebarSel();
+          });
+        } catch(_) {}
+      });
+    }
+
+    loadDir(root, document.getElementById('file-tree'));
+    loadWorkspaceState();
+  });
+});
+</script>
+</body>
+</html>
